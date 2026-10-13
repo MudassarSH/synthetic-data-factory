@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "document-degradation-synthesis"
+version = "0.1.0"
+description = "Seeded document defect synthesis with aligned soft masks"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "Pillow>=10"]
+
+[project.optional-dependencies]
+train = ["torch>=2"]
+
+[project.scripts]
+document-synthesis = "ml_service.training.preview:main"
+document-synthesis-split = "ml_service.training.split:main"
+document-synthesis-stats = "ml_service.training.stats:main"
+
+[tool.setuptools.packages.find]
+include = ["ml_service*"]

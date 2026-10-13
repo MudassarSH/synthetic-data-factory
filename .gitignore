@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.deps/
+.tmp/
+.pip-cache/
+*.egg-info/
+tests/temp/
+ml-data/generated-preview/
+ml-data/fixed-validation/
