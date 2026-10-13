@@ -30,7 +30,11 @@ python -m ml_service.training.preview ml-data/clean/train ml-data/generated-prev
 python -m ml_service.training.preview ml-data/clean/validation ml-data/fixed-validation --count 500 --seed 2026 --no-grid
 ```
 
-Each `sample_00000/` contains `input.png`, `mask.png`, and `metadata.json`. Contact sheets are saved in groups of 20 (`preview_grid_00.png`, etc.), up to the first 200 samples. The source page is loaded with EXIF orientation, fitted inside the requested square, and padded white. `--size` defaults to 512.
+Each `sample_00000/` contains `input.png`, `mask.png`, and `metadata.json`. Contact sheets are saved in groups of 20 (`preview_grid_00.png`, etc.), up to the first 200 samples. The source page is loaded with EXIF orientation and resized to fit the requested square. Defects are applied to the physical page before padding: artificial margins remain white with zero mask values. `page_bounds` in metadata records `[x, y, width, height]` inside the final canvas. `--size` defaults to 512.
+
+Exports require an empty destination by default. Use `--replace` to deliberately replace an export created by this version. The exporter generates the replacement in a staging directory before publishing it, removes stale samples/contact sheets, and refuses to replace unmanaged directories or unrelated files. A failed generation preserves the previous export. `export_manifest.json` records source checksums, sample identities/seeds, dimensions, geometry, mask interpretation, and defect weights. Legacy exports without this manifest must be regenerated in a new directory.
+
+The corrected page geometry changes generated pixels even with the same seeds. Keep existing validation sets for historical comparisons; create a new versioned validation export for the corrected generator.
 
 For fixed validation, a sample seed is a hash of the base seed, relative source path, and variant number. Fixed bleed-through mirrors the same source page so adding another source does not alter an existing page's result. Dynamic training uses a different random page when available. The sample's output index can still move; keep the split manifest and exported validation set fixed for comparisons across model runs.
 
@@ -42,10 +46,23 @@ python -m ml_service.training.stats ml-data/clean/train --count 5000 --seed 1234
 
 This generates masks in memory and reports clean, single, and multi-defect ratios; each defect type's prevalence and its own mask coverage mean/P50/P95; combined-mask coverage at thresholds 0.05, 0.15, 0.30, and 0.50; mean mask intensity; and coverage buckets. Per-defect coverage uses each defect's own mask at 0.05, including samples where that defect overlaps another. It saves no sample images. Both preview and stats reject a directory with immediate `train/` and `validation/` children, so pass one split leaf.
 
+Coverage statistics now exclude artificial padding. The report also measures document sampling, effective defects with nonzero coverage at 0.05, and each family's share of summed positive pixels (overlaps count once per family). `clean_sample_ratio` still means no selected defects; an ineffective bleed on a blank page can have a selected defect but no positive pixels.
+
+To inspect document-balanced dynamic training, including other-page bleed-through:
+
+```powershell
+python -m ml_service.training.stats ml-data/clean/train --count 5000 --seed 12345 --dynamic --sampling document --output ml-data/balanced-train-stats.json
+```
+
+Large-area haze/shadows and small rings/speckles need different sampling frequencies if you want more balanced positive-pixel contributions. `suggested_defect_weights` provides inverse-square-root conditional-coverage weights as a starting point. Pass a weights dictionary to the dataset or `synthesize`, or its JSON representation through `--defect-weights` in preview/stats. Unspecified families have weight 1; zero disables a family. Selection remains without replacement, and the defect-count distribution is renormalized if fewer than four families remain. Re-measure after applying weights: the suggestion does not guarantee equal pixel shares or represent a calibrated real-scan distribution.
+
 ## Stream into training
 
 ```python
-from ml_service.training.dataset import DocumentDefectDataset, find_images
+from torch.utils.data import DataLoader
+from ml_service.training.dataset import (
+    DocumentDefectDataset, collate_document_samples, find_images,
+)
 
 dataset = DocumentDefectDataset(
     find_images("ml-data/clean/train"),
@@ -53,25 +70,54 @@ dataset = DocumentDefectDataset(
     samples_per_epoch=10000,
     dynamic=True,
     as_torch=True,
+    source_root="ml-data/clean/train",
+    sampling="document",
+    # Illustrative starting weights; tune against statistics and real scans.
+    defect_weights={"haze": 0.2, "edge_shadow": 0.3, "fold_shadow": 0.4},
+    mask_mode="max",
+)
+loader = DataLoader(
+    dataset, batch_size=16, num_workers=2,
+    collate_fn=collate_document_samples, persistent_workers=False,
 )
 dataset.set_epoch(0)
-degraded, mask, metadata = dataset[0]
+for degraded, mask, metadata in loader:
+    # degraded: [B, 3, H, W]; mask: [B, 1, H, W]
+    # metadata is a list of dictionaries, preserving ragged defects/64-bit seeds.
+    pass
 ```
 
 The dataset returns channel-first tensors only when `as_torch=True`; otherwise it returns NumPy arrays. Set the epoch before creating each new `DataLoader` iterator. Use nonpersistent workers, since persistent worker copies do not see later calls to `set_epoch`. Dynamic sample seeds depend on base seed, epoch, and index, so processing order does not affect a sample. For fixed validation, use `dynamic=False` and pass `source_root="ml-data/clean/validation"`.
 
+Use `collate_document_samples` for batches: it stacks images/masks and leaves metadata as Python objects, so variable defect lists and unsigned 64-bit seeds are safe. It also supports NumPy batches. `sampling="page"` retains the original cycling policy. For dynamic training, `sampling="document"` selects a document uniformly, then a page uniformly within it. With `source_root`, top-level document folders define groups and root-level files are independent documents; without it, immediate parent folders define groups. Document balancing is opt-in and requires `dynamic=True`. On platforms using spawned workers, create the loader/iterate inside an `if __name__ == "__main__":` guard.
+
 ## Mask contract
 
-Each generator returns its applied local attenuation field, in `[0, 1]`; the composer takes the pixelwise maximum across defects. `0` means no applied defect, `0.1` is faint, and `0.5` is strong. Color tints vary channel attenuation by at most 15%, so mask values have roughly comparable meaning across families. Speckles and bleed-through also encode local dot or ink density in this field, rather than labeling whole bounding regions. The exported 8-bit PNG is a quantized version. The mask describes the generated defect region, including pixels over text where dark ink can hide the visible difference. It is therefore more useful for training than a thresholded absolute difference between images.
+Each generator returns its applied local attenuation field in `[0, 1]`. Choose the combined training target explicitly with `mask_mode` (or `--mask-mode` in preview/stats):
+
+- `max` (default): the pixelwise maximum of individual fields. This is a defect-region/maximum-strength target, not total accumulated darkening. Two overlapping neutral defects of 0.3 give a mask of 0.3.
+- `attenuation`: the mean RGB-channel attenuation after composing all fields and tints, `mean(1 - product(1 - mask_i * tint_i))`. Two overlapping neutral defects of 0.3 give 0.51. Use this for accumulated-strength regression.
+
+Both targets retain defects over black text, where visible image differences can be zero. Values encode applied strength, not binary class probabilities. For binary segmentation, define and keep a threshold consistent across training/evaluation; for strength regression, evaluate against the selected soft target. Color tints vary channel attenuation by at most 15%. Speckles and bleed-through encode local dot or ink density rather than whole bounding regions. Exported 8-bit PNG masks are quantized. Metadata and export manifests record the selected mask mode.
 
 The generator currently includes haze, irregular stains, broken elliptical rings, edge shadows, fold shadows, toner streaks, speckles, and mirrored reverse-page bleed-through. A sampled page has 0–4 distinct defect types with weights 20%, 35%, 30%, 12%, and 3%. The optional `reverse` image in `synthesize` supplies the reverse-page content for bleed-through; otherwise the current page is mirrored.
 
 ```python
-from ml_service.training.dataset import load_clean_image
+from ml_service.training.dataset import load_clean_page
 from ml_service.training.synthesis import synthesize
 
-clean = load_clean_image("ml-data/clean/train/page.png")
-degraded, soft_mask, metadata = synthesize(clean, seed=12345, source="page.png")
+clean = load_clean_page("ml-data/clean/train/page.png")
+degraded, soft_mask, metadata = synthesize(
+    clean, seed=12345, source="page.png", mask_mode="attenuation",
+)
 ```
 
 Before using the output for model training, inspect the contact sheets and full-resolution masks against a representative collection of your clean pages. In particular, check text overlap, rings, scanner borders, haze, and bleed-through. Realism still requires comparison with real scans; seeded synthesis alone cannot establish that match.
+
+## Tests
+
+```powershell
+python -m unittest discover -v
+```
+
+The core suite needs only NumPy and Pillow. Install the optional training dependency to also run real PyTorch collation and DataLoader checks with zero/two workers, spawned processes, and changing epochs. GitHub Actions runs core tests on Python 3.10/3.12 and a separate CPU-PyTorch integration job.
