@@ -20,4 +20,4 @@ def generate(image: np.ndarray, rng: np.random.Generator, reverse: np.ndarray | 
     strength = float(rng.uniform(0.12, 0.38))
     mask = ink * variation * strength
     result = darken(image, mask, (0.9, 0.95, 1.0))
-    return finish(result, mask, "bleed", strength=strength, angle=angle, source="current_page" if reverse is None else "supplied_page")
+    return finish(result, mask, "bleed", strength=strength, angle=angle, source="current_page" if reverse is None else "supplied_page", tint=(0.9, 0.95, 1.0))
