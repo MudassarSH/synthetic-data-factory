@@ -22,4 +22,4 @@ def generate(image: np.ndarray, rng: np.random.Generator):
     continuity = np.clip((angular + 0.8) * 1.8, 0.1, 1) * np.clip((breaks - 0.22) * 3, 0, 1)
     strength = float(rng.uniform(0.22, 0.7))
     mask = blur(edge * continuity * strength, max(0.8, min(h, w) * 0.004))
-    return finish(darken(image, mask, (1.0, 0.95, 0.9)), mask, "ring", center=[cx / w, cy / h], radii=[rx / w, ry / h], thickness=thickness, strength=strength)
+    return finish(darken(image, mask, (1.0, 0.95, 0.9)), mask, "ring", center=[cx / w, cy / h], radii=[rx / w, ry / h], thickness=thickness, strength=strength, tint=(1.0, 0.95, 0.9))
