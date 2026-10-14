@@ -121,3 +121,53 @@ python -m unittest discover -v
 ```
 
 The core suite needs only NumPy and Pillow. Install the optional training dependency to also run real PyTorch collation and DataLoader checks with zero/two workers, spawned processes, and changing epochs. GitHub Actions runs core tests on Python 3.10/3.12 and a separate CPU-PyTorch integration job.
+
+## Pilot segmentation training
+
+For the complete Google Colab upload, GPU setup, training, resume, evaluation, and download workflow, see [GOOGLE_COLAB_GUIDE.md](GOOGLE_COLAB_GUIDE.md).
+
+Install the training stack (PyTorch, torchvision, NumPy, Pillow, tqdm, matplotlib, and scikit-learn):
+
+```powershell
+python -m pip install -e ".[train]"
+```
+
+Optional augmentation/logging dependencies are available through `pip install -e ".[train,train-extras]"`; the initial loop does not require or enable them. Choose a PyTorch build appropriate for your GPU before installing the project extras.
+
+The five training modules are `model.py`, `losses.py`, `train.py`, `evaluate.py`, and `visualize_predictions.py`. The model uses the [torchvision MobileNetV3-Large ImageNet V2 encoder](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_large.html), with skip features at strides 2/4/8/16/32 and a depthwise-separable decoder of 160 → 96 → 64 → 32 → 16 → 1 channels. RGB normalization happens inside the model; inputs are not classification-cropped. It outputs `[B, 1, 512, 512]` logits for 512-square inputs, without applying sigmoid.
+
+Train with the existing clean training sources and the **exported** 500-sample validation set:
+
+```powershell
+python -m ml_service.training.train ml-data/clean/train ml-data/fixed-validation --output-dir ml-data/runs/pilot-01 --epochs 10 --samples-per-epoch 10000 --batch-size 8 --workers 2
+```
+
+Defaults are seed 12345, 512-square inputs, page sampling, maximum-field masks, AdamW with learning rate 0.0003, and equally weighted BCE + Dice. The encoder is pretrained by default; its weights download on the first run. `--no-pretrained` is available for offline smoke tests. `--sampling document` and `--defect-weights` expose the existing dataset's balancing controls without changing them.
+
+The attenuation mask is binarized at **≥0.05** for both training and validation. Predictions are thresholded at **>0.5** for reported binary metrics. These thresholds can be configured, are saved with the run, and are reused by standalone evaluation. Padding remains a negative target. Legacy exported validation sets without a manifest are accepted; their actual dimensions and mask mode are checked, and their image/mask/metadata bytes are fingerprinted. Validation is never regenerated or resized by the training stack. If you choose attenuation-mode training, export matching attenuation-mode validation first.
+
+CUDA automatically enables [autocast and gradient scaling](https://docs.pytorch.org/docs/stable/notes/amp_examples.html); CPU runs use float32. BCE and Dice reductions use float32 even under autocast. Use `--no-amp` to disable mixed precision. Worker processes are nonpersistent and spawned; the dataset epoch is set before each iterator. Training batches are shuffled with a seed derived from the base seed and epoch, preserving their ordering when resuming.
+
+Every epoch saves:
+
+- `previews/epoch_001.png`, etc.: 24 fixed **INPUT | TARGET | PREDICTION** examples, with a quarter reserved for clean pages where available. Prediction panels show continuous probabilities. Labels include mean predicted probability and coverage above 0.5.
+- `metrics.jsonl`: training/validation loss components, per-page Dice/IoU, micro Dice, pixel precision/recall, defect-only Dice, and clean-page diagnostics.
+- `last.pt`: model, optimizer, scaler, epoch, random states, configuration, and data fingerprints for resuming.
+- `best.pt`: the checkpoint with the lowest validation BCE + Dice loss.
+- `config.json`: the architecture, thresholds, data fingerprints, preview indices, and training settings.
+
+`clean_mean_predicted_probability` and `clean_predicted_coverage_gt_0_5` are measured over validation pages whose metadata has no selected defects, across the full canvas. Low values indicate fewer false alarms on those pages. Metrics also report the clean sample count; if no clean samples exist, these values are `null`. Empty prediction/target pairs have Dice/IoU 1, so inspect defect-only Dice and clean diagnostics alongside overall scores. Lower false positives on synthetic clean pages do not establish performance on real scans.
+
+Resume with a larger total epoch count and otherwise matching data/settings:
+
+```powershell
+python -m ml_service.training.train ml-data/clean/train ml-data/fixed-validation --output-dir ml-data/runs/pilot-01 --epochs 20 --samples-per-epoch 10000 --batch-size 8 --workers 2 --resume ml-data/runs/pilot-01/last.pt
+```
+
+Evaluate a saved checkpoint and write a fresh prediction sheet:
+
+```powershell
+python -m ml_service.training.evaluate ml-data/runs/pilot-01/best.pt ml-data/fixed-validation --output-dir ml-data/runs/pilot-01/evaluation
+```
+
+`python -m ml_service.training.visualize_predictions` accepts the same arguments as evaluation. Standalone evaluation loads model weights without downloading ImageNet weights again. Installed equivalents are `document-defect-train`, `document-defect-evaluate`, and `document-defect-previews`.
