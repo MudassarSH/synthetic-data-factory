@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 
@@ -97,6 +98,8 @@ def evaluate(model, loader, device, *, criterion=None, target_threshold=.05,
     tp = fp = fn = 0
     dice_sum = iou_sum = defect_dice_sum = 0.0
     clean_probability = clean_coverage = 0.0
+    clean_bce = defect_bce = 0.0
+    clean_records = []
     losses = {"loss": 0.0, "bce": 0.0, "dice_loss": 0.0}
     previews = {}
     requested = set(preview_indices)
@@ -110,6 +113,7 @@ def evaluate(model, loader, device, *, criterion=None, target_threshold=.05,
             probabilities = logits.float().sigmoid()
             predicted = probabilities > prediction_threshold
             actual = targets.bool()
+            sample_bce = F.binary_cross_entropy_with_logits(logits.float(), targets, reduction="none").mean(dim=(1, 2, 3))
             intersection = (predicted & actual).sum(dim=(1, 2, 3)).double()
             pred_count = predicted.sum(dim=(1, 2, 3)).double()
             true_count = actual.sum(dim=(1, 2, 3)).double()
@@ -131,9 +135,15 @@ def evaluate(model, loader, device, *, criterion=None, target_threshold=.05,
                     clean_count += 1
                     clean_probability += float(probabilities[i].mean())
                     clean_coverage += float((probabilities[i] > .5).float().mean())
+                    clean_bce += float(sample_bce[i])
+                    clean_records.append({"sample": record.get("sample"), "source": record.get("source"),
+                                          "mean_probability": float(probabilities[i].mean()),
+                                          "coverage_gt_0_5": float((probabilities[i] > .5).float().mean()),
+                                          "bce": float(sample_bce[i])})
                 else:
                     defect_count += 1
                     defect_dice_sum += float(dice[i])
+                    defect_bce += float(sample_bce[i])
                 index = record["sample_index"]
                 if index in requested:
                     previews[index] = {"image": images[i].cpu(), "target": targets[i].cpu(),
@@ -153,6 +163,12 @@ def evaluate(model, loader, device, *, criterion=None, target_threshold=.05,
             "clean_sample_count": clean_count,
             "clean_mean_predicted_probability": clean_probability / clean_count if clean_count else None,
             "clean_predicted_coverage_gt_0_5": clean_coverage / clean_count if clean_count else None,
+            "clean_bce": clean_bce / clean_count if clean_count else None,
+            "defect_bce": defect_bce / defect_count if defect_count else None,
+            "clean_false_positive_sample_fraction": sum(item["coverage_gt_0_5"] > 0 for item in clean_records) / clean_count if clean_count else None,
+            "clean_coverage_p50": float(np.percentile([item["coverage_gt_0_5"] for item in clean_records], 50)) if clean_records else None,
+            "clean_coverage_p95": float(np.percentile([item["coverage_gt_0_5"] for item in clean_records], 95)) if clean_records else None,
+            "worst_clean_samples": sorted(clean_records, key=lambda item: item["bce"], reverse=True)[:10],
             "target_threshold": target_threshold, "prediction_threshold": prediction_threshold,
         }
     finally:
@@ -181,7 +197,7 @@ def main():
     config = checkpoint["config"]
     dataset = FixedExportDataset(args.validation_dir, size=(config["size"], config["size"]),
                                  mask_mode=config["mask_mode"])
-    model = DocumentDefectModel(pretrained=False).to(device)
+    model = DocumentDefectModel(pretrained=False, decoder_dropout=config.get("decoder_dropout", 0.0)).to(device)
     model.load_state_dict(checkpoint["model"])
     options = {"multiprocessing_context": "spawn"} if args.workers else {}
     loader = DataLoader(dataset, batch_size=args.batch_size, num_workers=args.workers,
