@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 
@@ -11,21 +12,36 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from .augmentations import TrainingAugmentation
 from .dataset import DocumentDefectDataset, collate_document_samples, find_images, require_split_leaf
 from .evaluate import FixedExportDataset, evaluate, prediction_indices
 from .losses import BCEDiceLoss, segmentation_targets
 from .model import DocumentDefectModel
 
 
+def create_scheduler(optimizer, *, name="plateau", factor=.5, patience=2, min_lr=1e-6):
+    if name == "none":
+        return None
+    if name != "plateau":
+        raise ValueError("scheduler must be none or plateau")
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=factor, patience=patience,
+        threshold=1e-4, threshold_mode="abs", min_lr=min_lr,
+    )
+
+
 def train_epoch(model, loader, optimizer, criterion, scaler, device, *, target_threshold=.05,
-                amp=False, progress=True):
+                amp=False, progress=True, augmentation=None):
     model.train()
     totals = {"loss": 0.0, "bce": 0.0, "dice_loss": 0.0}
     count = 0
     iterator = tqdm(loader, desc="train", leave=False, disable=not progress)
-    for images, masks, _ in iterator:
+    for images, masks, metadata in iterator:
         images = images.to(device, non_blocking=True)
-        targets = segmentation_targets(masks.to(device, non_blocking=True), target_threshold)
+        masks = masks.to(device, non_blocking=True)
+        if augmentation is not None:
+            images, masks = augmentation(images, masks, metadata)
+        targets = segmentation_targets(masks, target_threshold)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
             logits = model(images)
@@ -81,7 +97,13 @@ def main():
     parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--augmentation", choices=("none", "standard", "strong"), default="standard")
+    parser.add_argument("--decoder-dropout", type=float, default=.1)
+    parser.add_argument("--lr-scheduler", choices=("none", "plateau"), default="plateau")
+    parser.add_argument("--lr-factor", type=float, default=.5)
+    parser.add_argument("--lr-patience", type=int, default=2)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--bce-weight", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
     parser.add_argument("--target-threshold", type=float, default=.05)
@@ -95,7 +117,9 @@ def main():
     parser.add_argument("--no-pretrained", action="store_true", help="random encoder initialization for offline smoke tests")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
-    parser.add_argument("--resume", type=Path, help="resume last.pt, preserving epoch seeds and optimizer state")
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", type=Path, help="resume last.pt, preserving epoch seeds and optimizer state")
+    initialization.add_argument("--init-checkpoint", type=Path, help="start a new experiment from model weights only; reset optimizer/epoch/scheduler")
     args = parser.parse_args()
     if min(args.epochs, args.samples_per_epoch, args.batch_size, args.preview_count, args.cpu_threads) <= 0:
         parser.error("epochs, samples, batch size, preview count, and CPU threads must be positive")
@@ -103,6 +127,11 @@ def main():
         parser.error("size must be >=64; workers/seed/weight decay nonnegative; lr positive")
     if not 0 < args.target_threshold <= 1 or not 0 < args.prediction_threshold < 1:
         parser.error("target threshold must be in (0,1]; prediction threshold in (0,1)")
+    if not 0 <= args.decoder_dropout < 1 or not 0 < args.lr_factor < 1 or args.lr_patience < 0:
+        parser.error("dropout must be in [0,1), LR factor in (0,1), patience nonnegative")
+    if not 0 <= args.min_lr <= args.lr or not all(math.isfinite(value) for value in
+            (args.lr, args.weight_decay, args.decoder_dropout, args.lr_factor, args.min_lr)):
+        parser.error("learning rates/regularization must be finite and 0 <= min-lr <= lr")
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else
                           "cpu" if args.device == "auto" else args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -151,18 +180,35 @@ def main():
         for key in compatible:
             if previous.get(key) != config[key]:
                 parser.error(f"resume setting/data mismatch: {key}")
+        legacy_defaults = {"augmentation": "none", "decoder_dropout": 0.0, "lr_scheduler": "none"}
+        for key, default in legacy_defaults.items():
+            if previous.get(key, default) != config[key]:
+                parser.error(f"resume setting mismatch: {key}; use --init-checkpoint in a new output directory to change training policy")
+        if args.lr_scheduler == "plateau":
+            for key in ("lr_factor", "lr_patience", "min_lr"):
+                if previous.get(key) != config[key]:
+                    parser.error(f"resume setting mismatch: {key}")
         if args.epochs <= checkpoint["epoch"] + 1:
             parser.error("--epochs must exceed completed checkpoint epochs")
     elif args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output directory is not empty; choose a new run directory or --resume")
-    model = DocumentDefectModel(pretrained=not args.no_pretrained and checkpoint is None).to(device)
+    warm_start = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True) if args.init_checkpoint else None
+    model = DocumentDefectModel(pretrained=not args.no_pretrained and checkpoint is None and warm_start is None,
+                                decoder_dropout=args.decoder_dropout).to(device)
+    if warm_start is not None:
+        model.load_state_dict(warm_start["model"])
+        config["initial_checkpoint_epoch"] = warm_start["epoch"] + 1
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = create_scheduler(optimizer, name=args.lr_scheduler, factor=args.lr_factor,
+                                 patience=args.lr_patience, min_lr=args.min_lr)
     criterion = BCEDiceLoss(args.bce_weight, args.dice_weight)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     start_epoch, best_loss = 0, float("inf")
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if scheduler is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
         if checkpoint["scaler"]:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch, best_loss = checkpoint["epoch"] + 1, checkpoint["best_loss"]
@@ -188,22 +234,31 @@ def main():
     train_loader = DataLoader(train_dataset, shuffle=True, generator=shuffle_generator, **loader_options)
     validation_loader = DataLoader(validation, shuffle=False, **loader_options)
     print(f"Device: {device}; AMP: {amp}; train sources: {len(paths)}; fixed validation: {len(validation)}", flush=True)
+    augmentation = TrainingAugmentation(args.augmentation)
     for epoch in range(start_epoch, args.epochs):
         train_dataset.set_epoch(epoch)
         shuffle_generator.manual_seed(args.seed + epoch)
+        learning_rate = optimizer.param_groups[0]["lr"]
         training = train_epoch(model, train_loader, optimizer, criterion, scaler, device,
-                               target_threshold=args.target_threshold, amp=amp, progress=not args.no_progress)
+                               target_threshold=args.target_threshold, amp=amp, progress=not args.no_progress,
+                               augmentation=augmentation)
         metrics = evaluate(model, validation_loader, device, criterion=criterion,
                            target_threshold=args.target_threshold, prediction_threshold=args.prediction_threshold,
                            amp=amp, preview_indices=preview_selection,
                            preview_path=args.output_dir / "previews" / f"epoch_{epoch + 1:03d}.png")
-        record = {"epoch": epoch + 1, "train": training, "validation": metrics}
+        if not math.isfinite(metrics["loss"]):
+            raise FloatingPointError("nonfinite validation loss")
+        if scheduler is not None:
+            scheduler.step(metrics["loss"])
+        record = {"epoch": epoch + 1, "train": training, "validation": metrics,
+                  "learning_rate": learning_rate, "next_learning_rate": optimizer.param_groups[0]["lr"]}
         with (args.output_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         improved = metrics["loss"] < best_loss
         best_loss = min(best_loss, metrics["loss"])
         state = {"format_version": 1, "epoch": epoch, "model": model.state_dict(),
                  "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
+                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
                  "best_loss": best_loss, "config": config, "rng": _rng_state(), "metrics": record}
         save_checkpoint(args.output_dir / "last.pt", state)
         if improved:
