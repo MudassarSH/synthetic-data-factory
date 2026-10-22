@@ -31,8 +31,10 @@ class DocumentDefectModel(nn.Module):
     happens internally, without classification cropping/resizing.
     """
 
-    def __init__(self, *, pretrained=True):
+    def __init__(self, *, pretrained=True, decoder_dropout=0.0):
         super().__init__()
+        if not 0 <= decoder_dropout < 1:
+            raise ValueError("decoder_dropout must be in [0,1)")
         weights = MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained else None
         backbone = mobilenet_v3_large(weights=weights)
         self.encoder = backbone.features[:16]
@@ -41,6 +43,8 @@ class DocumentDefectModel(nn.Module):
             DecoderBlock(64 + 24, 32), DecoderBlock(32 + 16, 16),
         ])
         self.head = nn.Conv2d(16, 1, 1)
+        # No parameters: existing checkpoints retain identical state-dict keys.
+        self.dropout = nn.Dropout2d(decoder_dropout)
         self.register_buffer("image_mean", torch.tensor([.485, .456, .406]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([.229, .224, .225]).view(1, 3, 1, 1))
 
@@ -56,4 +60,4 @@ class DocumentDefectModel(nn.Module):
                 features.append(x)
         for block, skip in zip(self.decoder, reversed(features[:-1])):
             x = block(x, skip)
-        return F.interpolate(self.head(x), size=output_size, mode="bilinear", align_corners=False)
+        return F.interpolate(self.head(self.dropout(x)), size=output_size, mode="bilinear", align_corners=False)
