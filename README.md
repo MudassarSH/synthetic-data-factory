@@ -126,13 +126,15 @@ The core suite needs only NumPy and Pillow. Install the optional training depend
 
 For the complete Google Colab upload, GPU setup, training, resume, evaluation, and download workflow, see [GOOGLE_COLAB_GUIDE.md](GOOGLE_COLAB_GUIDE.md).
 
+For Kaggle background jobs, input/output setup, and checkpoint recovery across sessions, see [KAGGLE_TRAINING_GUIDE.md](KAGGLE_TRAINING_GUIDE.md).
+
 Install the training stack (PyTorch, torchvision, NumPy, Pillow, tqdm, matplotlib, and scikit-learn):
 
 ```powershell
 python -m pip install -e ".[train]"
 ```
 
-Optional augmentation/logging dependencies are available through `pip install -e ".[train,train-extras]"`; the initial loop does not require or enable them. Choose a PyTorch build appropriate for your GPU before installing the project extras.
+Optional Albumentations/TensorBoard packages are available through `pip install -e ".[train,train-extras]"`. The built-in paired augmentation uses the existing torch/torchvision dependencies; TensorBoard logging is not enabled by installing a package. Choose a PyTorch build appropriate for your GPU before installing the project extras.
 
 The five training modules are `model.py`, `losses.py`, `train.py`, `evaluate.py`, and `visualize_predictions.py`. The model uses the [torchvision MobileNetV3-Large ImageNet V2 encoder](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_large.html), with skip features at strides 2/4/8/16/32 and a depthwise-separable decoder of 160 → 96 → 64 → 32 → 16 → 1 channels. RGB normalization happens inside the model; inputs are not classification-cropped. It outputs `[B, 1, 512, 512]` logits for 512-square inputs, without applying sigmoid.
 
@@ -142,7 +144,11 @@ Train with the existing clean training sources and the **exported** 500-sample v
 python -m ml_service.training.train ml-data/clean/train ml-data/fixed-validation --output-dir ml-data/runs/pilot-01 --epochs 10 --samples-per-epoch 10000 --batch-size 8 --workers 2
 ```
 
-Defaults are seed 12345, 512-square inputs, page sampling, maximum-field masks, AdamW with learning rate 0.0003, and equally weighted BCE + Dice. The encoder is pretrained by default; its weights download on the first run. `--no-pretrained` is available for offline smoke tests. `--sampling document` and `--defect-weights` expose the existing dataset's balancing controls without changing them.
+Defaults are seed 12345, 512-square inputs, page sampling, maximum-field masks, AdamW with learning rate 0.0003 and weight decay 0.001, and equally weighted BCE + Dice. New runs use standard augmentation, decoder dropout 0.1, and a validation-loss plateau scheduler. The encoder is pretrained by default; its weights download on the first run. `--no-pretrained` is available for offline smoke tests. `--sampling document` and `--defect-weights` expose the existing dataset's balancing controls without changing them.
+
+`augmentations.py` applies shared rotation/flip/scale/translation/elastic grids to images and soft masks, then image-only brightness/contrast/blur. Masks are binarized afterward; geometric fill is white for images and zero for masks. Sample-derived seeds make transformations independent of batching and worker order. Use `--augmentation strong` for wider variation or `--augmentation none` for a baseline. Strong augmentation includes mirrored/upside-down documents and small elastic warps; inspect whether these match your deployment documents. Brightness/contrast are global nuisance variations, not new labeled local stains. Validation is never augmented. Diversity is increased, not guaranteed to make every generated image unique.
+
+The [ReduceLROnPlateau scheduler](https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.ReduceLROnPlateau.html) monitors validation loss once per epoch. Defaults: `--lr-factor 0.5 --lr-patience 2 --min-lr 0.000001`. With patience 2, reduction occurs after three consecutive non-improving epochs (absolute improvement threshold 0.0001). `learning_rate` and `next_learning_rate` in each metrics record show the rate used and the rate selected for the next epoch. Scheduler state is saved/restored with checkpoints. Disable with `--lr-scheduler none`. `--decoder-dropout` controls spatial dropout immediately before the output head; it is inactive during evaluation and adds no checkpoint parameters.
 
 The attenuation mask is binarized at **≥0.05** for both training and validation. Predictions are thresholded at **>0.5** for reported binary metrics. These thresholds can be configured, are saved with the run, and are reused by standalone evaluation. Padding remains a negative target. Legacy exported validation sets without a manifest are accepted; their actual dimensions and mask mode are checked, and their image/mask/metadata bytes are fingerprinted. Validation is never regenerated or resized by the training stack. If you choose attenuation-mode training, export matching attenuation-mode validation first.
 
@@ -152,17 +158,27 @@ Every epoch saves:
 
 - `previews/epoch_001.png`, etc.: 24 fixed **INPUT | TARGET | PREDICTION** examples, with a quarter reserved for clean pages where available. Prediction panels show continuous probabilities. Labels include mean predicted probability and coverage above 0.5.
 - `metrics.jsonl`: training/validation loss components, per-page Dice/IoU, micro Dice, pixel precision/recall, defect-only Dice, and clean-page diagnostics.
-- `last.pt`: model, optimizer, scaler, epoch, random states, configuration, and data fingerprints for resuming.
+- `last.pt`: model, optimizer, scaler, scheduler, epoch, random states, configuration, and data fingerprints for resuming.
 - `best.pt`: the checkpoint with the lowest validation BCE + Dice loss.
 - `config.json`: the architecture, thresholds, data fingerprints, preview indices, and training settings.
 
 `clean_mean_predicted_probability` and `clean_predicted_coverage_gt_0_5` are measured over validation pages whose metadata has no selected defects, across the full canvas. Low values indicate fewer false alarms on those pages. Metrics also report the clean sample count; if no clean samples exist, these values are `null`. Empty prediction/target pairs have Dice/IoU 1, so inspect defect-only Dice and clean diagnostics alongside overall scores. Lower false positives on synthetic clean pages do not establish performance on real scans.
+
+Additional diagnostics separate `clean_bce` from `defect_bce`, report clean coverage P50/P95 and the fraction of clean samples with any false positive, and list `worst_clean_samples` (ranked by BCE) with source identities and coverage. Eighteen percent coverage means eighteen percent of clean pixels exceed 0.5; it does not mean harmless probabilities near zero. Inspect these samples and the existing BCE/Dice loss components when validation loss and thresholded Dice move in opposite directions.
 
 Resume with a larger total epoch count and otherwise matching data/settings:
 
 ```powershell
 python -m ml_service.training.train ml-data/clean/train ml-data/fixed-validation --output-dir ml-data/runs/pilot-01 --epochs 20 --samples-per-epoch 10000 --batch-size 8 --workers 2 --resume ml-data/runs/pilot-01/last.pt
 ```
+
+Changed augmentation/dropout/scheduler policies require a **new experiment**. To keep weights learned in the first pilot while resetting the optimizer, scheduler, and epoch counter:
+
+```powershell
+python -m ml_service.training.train ml-data/clean/train ml-data/fixed-validation --output-dir ml-data/runs/regularized-01 --init-checkpoint ml-data/runs/pilot-01/best.pt --epochs 10 --samples-per-epoch 10000 --batch-size 8 --workers 2 --augmentation strong --decoder-dropout 0.1 --weight-decay 0.001 --lr-scheduler plateau
+```
+
+Preserve the original pilot for comparison. `--init-checkpoint` loads only model weights and is mutually exclusive with `--resume`. New `best.pt` selection starts afresh. For exact continuation of a pre-regularization checkpoint, supply its old weight decay plus `--augmentation none --decoder-dropout 0 --lr-scheduler none`, retain its other settings, and use `--resume`. Older checkpoints remain readable for evaluation/inference; see the Colab guide's checkpoint-driven resume cell for automatic legacy defaults.
 
 Evaluate a saved checkpoint and write a fresh prediction sheet:
 
