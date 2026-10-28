@@ -69,6 +69,26 @@ def save_checkpoint(path, checkpoint):
     temporary.replace(path)
 
 
+def update_metric_selection(selection, primary, epoch):
+    """Mutate resumable score/epoch state; ties retain the earlier checkpoint.
+
+    Defect Dice deliberately retains the legacy selected-defect definition;
+    effective_defect_dice is separately reported for zero-coverage diagnosis.
+    """
+    improved = []
+    for name, value in (("loss", primary["loss"]), ("primary_dice", primary["dice"]),
+                        ("defect_dice", primary["defect_dice"])):
+        if value is None:
+            continue
+        if not math.isfinite(value):
+            raise FloatingPointError(f"nonfinite selection metric: {name}")
+        previous = selection.get(name)
+        if previous is None or (value < previous["value"] if name == "loss" else value > previous["value"]):
+            selection[name] = {"value": value, "epoch": epoch}
+            improved.append(name)
+    return improved
+
+
 def _rng_state():
     state = np.random.get_state()
     return {"torch": torch.get_rng_state(), "python": random.getstate(),
@@ -112,6 +132,7 @@ def main():
     parser.add_argument("--sampling", choices=("page", "document"), default="page")
     parser.add_argument("--defect-weights", type=json.loads)
     parser.add_argument("--preview-count", type=int, default=24)
+    parser.add_argument("--exclude-document", action="append", default=[], help="exclude exact validation source document from primary selection, retaining it as stress data; repeatable")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--no-pretrained", action="store_true", help="random encoder initialization for offline smoke tests")
@@ -149,6 +170,14 @@ def main():
                                           source_root=args.train_dir, sampling=args.sampling,
                                           defect_weights=args.defect_weights, mask_mode=args.mask_mode)
     validation = FixedExportDataset(args.validation_dir, size=(args.size, args.size), mask_mode=args.mask_mode)
+    args.exclude_document = sorted(set(args.exclude_document))
+    from .diagnostics import source_document
+    validation_documents = {source_document(r) for r in validation.metadata}
+    unknown = set(args.exclude_document) - validation_documents
+    if unknown:
+        parser.error(f"excluded validation documents not found: {sorted(unknown)}")
+    if not validation_documents - set(args.exclude_document):
+        parser.error("supported-domain validation would be empty")
     train_groups = {path.resolve().relative_to(args.train_dir.resolve()).parts[0] for path in paths}
     validation_groups = {str(record.get("source", "")).replace("\\", "/").split("/")[0]
                          for record in validation.metadata}
@@ -180,7 +209,7 @@ def main():
         for key in compatible:
             if previous.get(key) != config[key]:
                 parser.error(f"resume setting/data mismatch: {key}")
-        legacy_defaults = {"augmentation": "none", "decoder_dropout": 0.0, "lr_scheduler": "none"}
+        legacy_defaults = {"augmentation": "none", "decoder_dropout": 0.0, "lr_scheduler": "none", "exclude_document": []}
         for key, default in legacy_defaults.items():
             if previous.get(key, default) != config[key]:
                 parser.error(f"resume setting mismatch: {key}; use --init-checkpoint in a new output directory to change training policy")
@@ -204,6 +233,7 @@ def main():
     criterion = BCEDiceLoss(args.bce_weight, args.dice_weight)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     start_epoch, best_loss = 0, float("inf")
+    selection = {}
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -213,6 +243,7 @@ def main():
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch, best_loss = checkpoint["epoch"] + 1, checkpoint["best_loss"]
         _restore_rng(checkpoint["rng"])
+        selection = checkpoint.get("metric_selection", {"loss": {"value": best_loss, "epoch": None}})
     args.output_dir.mkdir(parents=True, exist_ok=True)
     history_path = args.output_dir / "metrics.jsonl"
     if checkpoint is not None and history_path.exists():
@@ -245,25 +276,40 @@ def main():
         metrics = evaluate(model, validation_loader, device, criterion=criterion,
                            target_threshold=args.target_threshold, prediction_threshold=args.prediction_threshold,
                            amp=amp, preview_indices=preview_selection,
-                           preview_path=args.output_dir / "previews" / f"epoch_{epoch + 1:03d}.png")
-        if not math.isfinite(metrics["loss"]):
+                           preview_path=args.output_dir / "previews" / f"epoch_{epoch + 1:03d}.png",
+                           excluded_documents=args.exclude_document,
+                           diagnostics_dir=args.output_dir / "diagnostics" / f"epoch_{epoch + 1:03d}")
+        primary = metrics["domains"]["supported"]
+        if not math.isfinite(primary["loss"]):
             raise FloatingPointError("nonfinite validation loss")
         if scheduler is not None:
-            scheduler.step(metrics["loss"])
+            scheduler.step(primary["loss"])
         record = {"epoch": epoch + 1, "train": training, "validation": metrics,
+                  "selection_domain": "supported", "selection_fingerprint": primary["fingerprint"],
                   "learning_rate": learning_rate, "next_learning_rate": optimizer.param_groups[0]["lr"]}
         with (args.output_dir / "metrics.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
-        improved = metrics["loss"] < best_loss
-        best_loss = min(best_loss, metrics["loss"])
+        improvements = update_metric_selection(selection, primary, epoch + 1)
+        best_loss = selection["loss"]["value"]
         state = {"format_version": 1, "epoch": epoch, "model": model.state_dict(),
                  "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                  "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                 "best_loss": best_loss, "config": config, "rng": _rng_state(), "metrics": record}
+                 "best_loss": best_loss, "metric_selection": selection,
+                 "selection_domain": "supported", "selection_fingerprint": primary["fingerprint"],
+                 "config": config, "rng": _rng_state(), "metrics": record}
         save_checkpoint(args.output_dir / "last.pt", state)
-        if improved:
+        for metric in improvements:
+            filename = {"loss": "best_loss.pt", "primary_dice": "best_primary_dice.pt", "defect_dice": "best_defect_dice.pt"}[metric]
+            save_checkpoint(args.output_dir / filename, state)
+        if "loss" in improvements:
             save_checkpoint(args.output_dir / "best.pt", state)
-        print(json.dumps(record), flush=True)
+        # Full source/family diagnostics are in metrics.jsonl; keep notebook
+        # output bounded even for hundreds of validation source pages.
+        print(json.dumps({"epoch": epoch + 1, "train_loss": training["loss"],
+                          "primary_loss": primary["loss"], "primary_dice": primary["dice"],
+                          "primary_defect_dice": primary["defect_dice"],
+                          "full_loss": metrics["loss"], "next_learning_rate": optimizer.param_groups[0]["lr"],
+                          "improved_checkpoints": improvements}), flush=True)
 
 
 if __name__ == "__main__":

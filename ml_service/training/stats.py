@@ -1,8 +1,9 @@
-"""Summarize synthesized dataset balance without writing sample images."""
+"""Audit synthesis balance and optionally export samples for human realism review."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -24,9 +25,9 @@ def _percent_summary(values: list[float]) -> dict:
     }
 
 
-def summarize(clean_dir: str | Path, *, count=5000, seed=0, size=(512, 512), dynamic=False, sampling="page", defect_weights=None, mask_mode="max") -> dict:
-    if count <= 0:
-        raise ValueError("count must be positive")
+def summarize(clean_dir: str | Path, *, count=5000, seed=0, size=(512, 512), dynamic=False, sampling="page", defect_weights=None, mask_mode="max", reviews=None, review_dir=None, review_count=32) -> dict:
+    if count <= 0 or review_count <= 0:
+        raise ValueError("count and review_count must be positive")
     require_split_leaf(clean_dir)
     paths = find_images(clean_dir)
     dataset = DocumentDefectDataset(paths, size=size, seed=seed, samples_per_epoch=count,
@@ -41,12 +42,46 @@ def summarize(clean_dir: str | Path, *, count=5000, seed=0, size=(512, 512), dyn
     document_counts = Counter()
     effective_counts = Counter()
     type_pixels = Counter()
+    document_pixels = Counter()
+    effectively_clean = 0
+    review_labels = {}
+    if reviews is not None:
+        for entry in json.loads(Path(reviews).read_text(encoding="utf-8")):
+            if entry["label"] not in ("unreviewed", "realistic", "unrealistic", "uncertain"):
+                raise ValueError("review labels must be unreviewed, realistic, unrealistic or uncertain")
+            if entry["id"] in review_labels:
+                raise ValueError("duplicate review id")
+            review_labels[entry["id"]] = entry["label"]
+    realism_counts, realism_pixels = Counter(), Counter()
+    matched_review_ids = set()
+    review_template = []
+    if review_dir is not None:
+        review_dir = Path(review_dir)
+        if review_dir.exists() and any(review_dir.iterdir()):
+            raise ValueError("review directory must be empty (protects existing human labels)")
+        review_dir.mkdir(parents=True, exist_ok=True)
     for index in range(count):
-        _, mask, metadata = dataset[index]
+        image, mask, metadata = dataset[index]
+        sample_id = hashlib.sha256(image.tobytes() + mask.tobytes() + json.dumps(metadata, sort_keys=True).encode()).hexdigest()
+        review_label = review_labels.get(sample_id, "unreviewed")
+        if sample_id in review_labels:
+            matched_review_ids.add(sample_id)
+        realism_counts[review_label] += 1
+        if review_dir is not None and index < review_count:
+            from PIL import Image
+            filename = f"sample_{index:05d}.png"
+            Image.fromarray(np.uint8(np.clip(image, 0, 1) * 255 + .5)).save(review_dir / filename)
+            Image.fromarray(np.uint8(np.clip(mask, 0, 1) * 255 + .5)).save(review_dir / f"mask_{index:05d}.png")
+            review_template.append({"id": sample_id, "source": metadata["source"], "seed": metadata["seed"], "image": filename, "label": review_label})
         defects = metadata["defects"]
         x, y, w, h = metadata["page_bounds"]
         mask = mask[y:y + h, x:x + w]
-        document_counts[metadata["source"].split("/")[0]] += 1
+        document = metadata["source"].split("/")[0]
+        document_counts[document] += 1
+        positive_pixels = int((mask >= .05).sum())
+        effectively_clean += positive_pixels == 0
+        document_pixels[document] += positive_pixels
+        realism_pixels[review_label] += positive_pixels
         effective_counts[sum(defect["coverage_at_0.05"] > 0 for defect in defects)] += 1
         defect_counts[len(defects)] += 1
         type_counts.update(defect["type"] for defect in defects)
@@ -57,7 +92,11 @@ def summarize(clean_dir: str | Path, *, count=5000, seed=0, size=(512, 512), dyn
             threshold_coverages[threshold].append(float(np.mean(mask >= threshold)))
         coverages.append(threshold_coverages[0.05][-1])
         mean_intensities.append(float(mask.mean()))
+    if review_dir is not None:
+        (review_dir / "reviews.json").write_text(json.dumps(review_template, indent=2) + "\n", encoding="utf-8")
     coverage = np.asarray(coverages)
+    total_positive = sum(document_pixels.values())
+    source_pages = Counter(path.resolve().relative_to(Path(clean_dir).resolve()).parts[0] for path in paths)
     bins = [0, 0.01, 0.1, 0.3, 0.6, 1.000001]
     names = ["<1%", "1-10%", "10-30%", "30-60%", ">60%"]
     total_type_pixels = sum(type_pixels.values())
@@ -65,6 +104,17 @@ def summarize(clean_dir: str | Path, *, count=5000, seed=0, size=(512, 512), dyn
     minimum = min(means.values(), default=0)
     return {
         "sample_count": count,
+        "effective_clean_sample_count": int(effectively_clean),
+        "effective_clean_sample_ratio": effectively_clean / count,
+        "document_source_page_count": dict(sorted(source_pages.items())),
+        "document_source_page_percent": {doc: 100 * pages / len(paths) for doc, pages in sorted(source_pages.items())},
+        "document_sample_count": dict(sorted(document_counts.items())),
+        "sampling_note": "Page sampling visits sorted paths cyclically from index zero; counts shorter than the source list do not represent a full source cycle. Compare using the intended epoch budget.",
+        "document_positive_pixel_share_percent": {doc: 100 * pixels / total_positive if total_positive else 0. for doc, pixels in sorted(document_pixels.items())},
+        "realism": {"label_source": "human_review_only", "sample_counts": dict(realism_counts),
+                    "positive_pixel_counts": dict(realism_pixels),
+                    "unmatched_review_ids": len(set(review_labels) - matched_review_ids),
+                    "note": "Unreviewed samples have unknown realism. Image+mask+metadata hashes bind labels to exact generated samples."},
         "base_seed": int(seed), "size": list(size), "dynamic": dynamic,
         "sampling": sampling, "mask_mode": mask_mode, "defect_weights": dataset.defect_weights,
         "coverage_region": "physical_page_excluding_padding",
@@ -108,13 +158,22 @@ def main() -> None:
     parser.add_argument("--dynamic", action="store_true", help="measure the dynamic training policy, including other-page bleed")
     parser.add_argument("--sampling", choices=("page", "document"), default="page")
     parser.add_argument("--defect-weights", type=json.loads, help="JSON weights by defect name")
+    parser.add_argument("--compare-sampling", action="store_true", help="audit page and document policies with identical seeds; does not change training defaults")
+    parser.add_argument("--reviews", type=Path, help="human-labelled reviews.json from a previous identical audit")
+    parser.add_argument("--review-dir", type=Path, help="write a bounded sample gallery and reviews.json template to an empty directory")
+    parser.add_argument("--review-count", type=int, default=32)
     parser.add_argument("--mask-mode", choices=("max", "attenuation"), default="max")
     args = parser.parse_args()
-    if args.count <= 0 or args.size <= 0:
+    if args.count <= 0 or args.size <= 0 or args.review_count <= 0:
         parser.error("--count and --size must be positive")
     try:
-        report = summarize(args.clean_dir, count=args.count, seed=args.seed, size=(args.size, args.size),
-                           dynamic=args.dynamic, sampling=args.sampling, defect_weights=args.defect_weights, mask_mode=args.mask_mode)
+        policies = ("page", "document") if args.compare_sampling else (args.sampling,)
+        reports = {policy: summarize(args.clean_dir, count=args.count, seed=args.seed, size=(args.size, args.size),
+                           dynamic=args.dynamic or args.compare_sampling, sampling=policy,
+                           defect_weights=args.defect_weights, mask_mode=args.mask_mode, reviews=args.reviews,
+                           review_dir=(args.review_dir / policy if args.compare_sampling else args.review_dir) if args.review_dir else None,
+                           review_count=args.review_count) for policy in policies}
+        report = reports if args.compare_sampling else reports[args.sampling]
     except ValueError as error:
         parser.error(str(error))
     serialized = json.dumps(report, indent=2)

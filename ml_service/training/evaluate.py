@@ -13,7 +13,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from .dataset import collate_document_samples
 from .losses import BCEDiceLoss, segmentation_targets
-from .visualize_predictions import save_prediction_sheet
+from .visualize_predictions import save_prediction_sheet, save_mask_diagnostic_sheet
+from .diagnostics import pixel_diagnostics, domain_report, source_document
 
 
 class FixedExportDataset(Dataset):
@@ -28,12 +29,17 @@ class FixedExportDataset(Dataset):
             raise ValueError(f"no exported validation samples in {self.root}")
         self.size = tuple(size)
         self.metadata = []
+        self.sample_fingerprints = {}
         digest = hashlib.sha256()
         for index, sample in enumerate(self.samples):
+            sample_digest = hashlib.sha256()
             for name in ("input.png", "mask.png", "metadata.json"):
                 file = sample / name
                 digest.update(f"{sample.name}/{name}\0".encode())
-                digest.update(hashlib.sha256(file.read_bytes()).digest())
+                content_hash = hashlib.sha256(file.read_bytes()).digest()
+                digest.update(content_hash)
+                sample_digest.update(name.encode() + content_hash)
+            self.sample_fingerprints[sample.name] = sample_digest.hexdigest()
             record = json.loads((sample / "metadata.json").read_text(encoding="utf-8"))
             if record.get("mask_mode", "max") != mask_mode:
                 raise ValueError(f"mask mode mismatch in {sample}")
@@ -88,89 +94,84 @@ def prediction_indices(dataset, count=24, seed=2026):
 
 @torch.inference_mode()
 def evaluate(model, loader, device, *, criterion=None, target_threshold=.05,
-             prediction_threshold=.5, amp=False, preview_indices=(), preview_path=None):
+             prediction_threshold=.5, amp=False, preview_indices=(), preview_path=None,
+             excluded_documents=(), diagnostics_dir=None):
+    """Legacy top-level metrics remain full-set; domain summaries are additive.
+
+    Exclusions affect reporting only here. Training explicitly monitors supported
+    metrics. Family breakdowns measure the entire combined target on samples
+    selecting that family; overlapping families are not isolated ground truth.
+    """
     if not 0 < prediction_threshold < 1:
         raise ValueError("prediction threshold must be in (0,1)")
     criterion = criterion or BCEDiceLoss()
     was_training = model.training
     model.eval()
-    count = clean_count = defect_count = 0
-    tp = fp = fn = 0
-    dice_sum = iou_sum = defect_dice_sum = 0.0
-    clean_probability = clean_coverage = 0.0
-    clean_bce = defect_bce = 0.0
-    clean_records = []
-    losses = {"loss": 0.0, "bce": 0.0, "dice_loss": 0.0}
-    previews = {}
+    rows, previews = [], {}
     requested = set(preview_indices)
+    fingerprints = getattr(getattr(loader, "dataset", None), "sample_fingerprints", {})
     try:
         for images, masks, metadata in loader:
             images = images.to(device, non_blocking=True)
             targets = segmentation_targets(masks.to(device, non_blocking=True), target_threshold)
             with torch.autocast(device_type=device.type, enabled=amp and device.type == "cuda"):
                 logits = model(images)
-            parts = criterion.components(logits, targets)
             probabilities = logits.float().sigmoid()
-            predicted = probabilities > prediction_threshold
-            actual = targets.bool()
-            sample_bce = F.binary_cross_entropy_with_logits(logits.float(), targets, reduction="none").mean(dim=(1, 2, 3))
-            intersection = (predicted & actual).sum(dim=(1, 2, 3)).double()
-            pred_count = predicted.sum(dim=(1, 2, 3)).double()
-            true_count = actual.sum(dim=(1, 2, 3)).double()
-            denominator = pred_count + true_count
-            union = denominator - intersection
-            dice = torch.where(denominator > 0, 2 * intersection / denominator.clamp_min(1), 1)
-            iou = torch.where(union > 0, intersection / union.clamp_min(1), 1)
-            n = len(metadata)
-            count += n
-            for key in losses:
-                losses[key] += float(parts[key]) * n
-            tp += int(intersection.sum())
-            fp += int((pred_count - intersection).sum())
-            fn += int((true_count - intersection).sum())
-            dice_sum += float(dice.sum())
-            iou_sum += float(iou.sum())
+            bce_map = F.binary_cross_entropy_with_logits(logits.float(), targets, reduction="none")
+            # Per-sample components preserve custom criterion weights/smoothing.
             for i, record in enumerate(metadata):
-                if not record.get("defects", []):
-                    clean_count += 1
-                    clean_probability += float(probabilities[i].mean())
-                    clean_coverage += float((probabilities[i] > .5).float().mean())
-                    clean_bce += float(sample_bce[i])
-                    clean_records.append({"sample": record.get("sample"), "source": record.get("source"),
-                                          "mean_probability": float(probabilities[i].mean()),
-                                          "coverage_gt_0_5": float((probabilities[i] > .5).float().mean()),
-                                          "bce": float(sample_bce[i])})
-                else:
-                    defect_count += 1
-                    defect_dice_sum += float(dice[i])
-                    defect_bce += float(sample_bce[i])
-                index = record["sample_index"]
+                parts = criterion.components(logits[i:i+1], targets[i:i+1])
+                probability = probabilities[i, 0].cpu().numpy()
+                actual = targets[i, 0].bool().cpu().numpy()
+                predicted = probability > prediction_threshold
+                tp = int((predicted & actual).sum())
+                fp = int((predicted & ~actual).sum())
+                fn = int((~predicted & actual).sum())
+                strength = masks[i, 0].cpu().numpy()
+                rgb = images[i].cpu().numpy()
+                pixel = pixel_diagnostics(probability, actual, strength, rgb, bce_map[i, 0].cpu().numpy(), prediction_threshold)
+                index = record.get("sample_index", len(rows))
+                sample = str(record.get("sample", index))
+                row = {"sample": sample, "source": str(record.get("source", "unknown")),
+                       "document": source_document(record), "seed": record.get("seed"),
+                       "content_fingerprint": fingerprints.get(sample),
+                       "selected_defects": record.get("defects", []),
+                       "defect_families": sorted({d["type"] for d in record.get("defects", [])}),
+                       "synthetically_clean": not record.get("defects", []),
+                       "is_effectively_clean": not bool(actual.any()),
+                       "target_positive_coverage": float(actual.mean()),
+                       "mean_probability": float(probability.mean()),
+                       "coverage_gt_0_5": float((probability > .5).mean()),
+                       "predicted_coverage": float(predicted.mean()),
+                       "tp": tp, "fp": fp, "fn": fn,
+                       "dice": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.,
+                       "iou": tp / (tp + fp + fn) if tp + fp + fn else 1.,
+                       **{key: float(value) for key, value in parts.items()}, **pixel,
+                       "largest_predicted_region_coverage": pixel["largest_predicted_region_pixels"] / actual.size}
+                rows.append(row)
                 if index in requested:
                     previews[index] = {"image": images[i].cpu(), "target": targets[i].cpu(),
-                                       "probability": probabilities[i].cpu(), "metadata": record}
-        if not count:
+                                       "mask": masks[i].cpu(), "probability": probabilities[i].cpu(), "metadata": {**record, "prediction_threshold": prediction_threshold}}
+        if not rows:
             raise ValueError("validation loader is empty")
+        domains = domain_report(rows, excluded_documents)
+        # Do not attach domains to their own full object (would be recursive).
+        result = dict(domains["full"])
+        result.update({"domains": domains, "excluded_documents": sorted(set(excluded_documents)),
+                       "target_threshold": target_threshold, "prediction_threshold": prediction_threshold,
+                       "metric_region": "full_canvas_including_padding",
+                       "family_metric_scope": "combined_target_on_samples_selecting_family"})
+        examples = [previews[i] for i in sorted(previews)]
         if preview_path is not None:
-            save_prediction_sheet([previews[i] for i in sorted(previews)], preview_path)
-        return {
-            "sample_count": count, **{key: value / count for key, value in losses.items()},
-            "dice": dice_sum / count, "iou": iou_sum / count,
-            "micro_dice": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0,
-            "precision": tp / (tp + fp) if tp + fp else (1.0 if not fn else 0.0),
-            "recall": tp / (tp + fn) if tp + fn else 1.0,
-            "defect_sample_count": defect_count,
-            "defect_dice": defect_dice_sum / defect_count if defect_count else None,
-            "clean_sample_count": clean_count,
-            "clean_mean_predicted_probability": clean_probability / clean_count if clean_count else None,
-            "clean_predicted_coverage_gt_0_5": clean_coverage / clean_count if clean_count else None,
-            "clean_bce": clean_bce / clean_count if clean_count else None,
-            "defect_bce": defect_bce / defect_count if defect_count else None,
-            "clean_false_positive_sample_fraction": sum(item["coverage_gt_0_5"] > 0 for item in clean_records) / clean_count if clean_count else None,
-            "clean_coverage_p50": float(np.percentile([item["coverage_gt_0_5"] for item in clean_records], 50)) if clean_records else None,
-            "clean_coverage_p95": float(np.percentile([item["coverage_gt_0_5"] for item in clean_records], 95)) if clean_records else None,
-            "worst_clean_samples": sorted(clean_records, key=lambda item: item["bce"], reverse=True)[:10],
-            "target_threshold": target_threshold, "prediction_threshold": prediction_threshold,
-        }
+            save_prediction_sheet(examples, preview_path)
+        if diagnostics_dir is not None:
+            destination = Path(diagnostics_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "samples.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            (destination / "metrics.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            if examples:
+                save_mask_diagnostic_sheet(examples, destination / "mask_overlays.png")
+        return result
     finally:
         model.train(was_training)
 
@@ -186,6 +187,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--preview-count", type=int, default=24)
+    parser.add_argument("--exclude-document", action="append", default=None, help="exact top-level source document; repeatable; defaults to checkpoint policy")
     args = parser.parse_args()
     if args.batch_size <= 0 or args.workers < 0 or args.preview_count <= 0:
         parser.error("batch size/preview count must be positive; workers must be nonnegative")
@@ -207,7 +209,9 @@ def main():
                        target_threshold=config["target_threshold"],
                        prediction_threshold=config["prediction_threshold"], amp=device.type == "cuda",
                        preview_indices=prediction_indices(dataset, args.preview_count, config["seed"]),
-                       preview_path=args.output_dir / "predictions.png")
+                       preview_path=args.output_dir / "predictions.png",
+                       excluded_documents=args.exclude_document if args.exclude_document is not None else config.get("exclude_document", []),
+                       diagnostics_dir=args.output_dir / "diagnostics")
     metrics["validation_fingerprint"] = dataset.fingerprint
     metrics["checkpoint_epoch"] = checkpoint["epoch"]
     args.output_dir.mkdir(parents=True, exist_ok=True)
