@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "Pillow>=10"]
 
 [project.optional-dependencies]
-train = ["torch>=2.3", "torchvision>=0.18", "tqdm>=4", "matplotlib>=3.7", "scikit-learn>=1.3"]
+train = ["torch>=2.3", "torchvision>=0.18", "tqdm>=4", "matplotlib>=3.7", "scikit-learn>=1.3", "scipy>=1.10"]
 train-extras = ["albumentations>=1.4", "tensorboard>=2.14"]
 
 [project.scripts]
@@ -20,6 +20,7 @@ document-synthesis-stats = "ml_service.training.stats:main"
 document-defect-train = "ml_service.training.train:main"
 document-defect-evaluate = "ml_service.training.evaluate:main"
 document-defect-previews = "ml_service.training.visualize_predictions:main"
+document-defect-acceptance = "ml_service.training.acceptance:main"
 
 [tool.setuptools.packages.find]
 include = ["ml_service*"]
